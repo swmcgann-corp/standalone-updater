@@ -1,0 +1,10 @@
+<Configuration>
+  <!-- Change SourcePath to the final local toolkit path on the isolated PC. -->
+  <Add SourcePath="C:\OfflinePatchKit\30-Office\Source" OfficeClientEdition="64" Channel="PerpetualVL2021" AllowCdnFallback="FALSE">
+    <Product ID="ProPlus2021Volume">
+      <Language ID="en-us" />
+    </Product>
+  </Add>
+  <Display Level="None" AcceptEULA="TRUE" />
+  <Property Name="FORCEAPPSHUTDOWN" Value="TRUE" />
+</Configuration>

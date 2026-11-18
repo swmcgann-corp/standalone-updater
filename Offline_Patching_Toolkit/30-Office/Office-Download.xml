@@ -1,0 +1,8 @@
+<Configuration>
+  <!-- Adjust architecture, product IDs, and every installed language before download. -->
+  <Add SourcePath="C:\OfflinePatchStaging\Office2021" OfficeClientEdition="32" Channel="PerpetualVL2021" AllowCdnFallback="FALSE">
+    <Product ID="ProPlus2021Volume">
+      <Language ID="en-us" />
+    </Product>
+  </Add>
+</Configuration>

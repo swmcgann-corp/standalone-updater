@@ -1,0 +1,8 @@
+Stage,Sequence,Enabled,Component,RelativePath,Arguments,Description
+PreReboot,10,FALSE,DefenderSecurityIntelligence,20-Payload\Defender\mpam-fe.exe,,Apply current Defender security intelligence and engine package
+PreReboot,20,FALSE,WindowsPackage,20-Payload\Windows\CheckpointAndLCU\REPLACE-WITH-FIRST-CHECKPOINT.msu,,Install first required checkpoint cumulative update
+PreReboot,30,FALSE,WindowsPackage,20-Payload\Windows\CheckpointAndLCU\REPLACE-WITH-TARGET-LCU.msu,,Install target Windows cumulative update
+PreReboot,40,FALSE,WindowsPackage,20-Payload\Windows\Other\REPLACE-WITH-DOTNET-OR-OTHER.msu,,Install other applicable Windows or .NET security update
+PostReboot,50,FALSE,DefenderPlatform,20-Payload\Defender\updateplatform.exe,,Apply Defender antimalware platform update KB4052623
+PostReboot,60,FALSE,OfficeODT,30-Office\setup.exe,30-Office\Office-Apply.xml,Update Office LTSC 2021 from the complete local source
+PostReboot,70,FALSE,EdgeMSI,20-Payload\Edge\MicrosoftEdgeEnterpriseX64.msi,,Update Microsoft Edge Stable

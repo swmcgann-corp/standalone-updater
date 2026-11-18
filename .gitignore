@@ -1,0 +1,23 @@
+# Downloaded Microsoft payloads
+*.cab
+*.cat
+*.dat
+*.exe
+*.msi
+*.msu
+/Offline_Patching_Toolkit/20-Payload/**/*
+!/Offline_Patching_Toolkit/20-Payload/**/
+!/Offline_Patching_Toolkit/20-Payload/**/PLACE-*.txt
+/Offline_Patching_Toolkit/30-Office/Source/*
+!/Offline_Patching_Toolkit/30-Office/Source/PLACE-ODT-OFFICE-SOURCE-HERE.txt
+
+# Generated deployments, manifests, and device reports
+Deployments/
+Deploy_*/
+Deploy_*-Verification.csv
+*.log
+/Offline_Patching_Toolkit/00-Control/Package.json
+/Offline_Patching_Toolkit/00-Control/PayloadManifest.csv
+/Offline_Patching_Toolkit/00-Control/PayloadManifest.json
+/Offline_Patching_Toolkit/40-Logs/
+/Offline_Patching_Toolkit/50-Reports/

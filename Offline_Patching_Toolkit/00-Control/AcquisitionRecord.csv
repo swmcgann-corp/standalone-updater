@@ -1,0 +1,6 @@
+Component,TargetProduct,TargetVersionOrKB,Architecture,SourcePage,DownloadDateUTC,Operator,Notes
+Windows,Windows 11,,,,,,
+Office,Office LTSC Professional Plus 2021,PerpetualVL2021,,,,,
+Defender Security Intelligence,Microsoft Defender Antivirus,KB2267602,,,,,
+Defender Platform,Microsoft Defender Antivirus,KB4052623,,,,,
+Edge,Microsoft Edge Stable,,,,,,
