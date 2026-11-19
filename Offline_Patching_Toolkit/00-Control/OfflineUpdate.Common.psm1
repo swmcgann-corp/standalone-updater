@@ -169,6 +169,16 @@ function Get-SystemInventory {
     }
 }
 
+function ConvertFrom-SoftwareInstallDate {
+    param([string]$Value)
+    $culture = [Globalization.CultureInfo]::InvariantCulture
+    $date = [datetime]::MinValue
+    if ([datetime]::TryParseExact($Value, 'yyyyMMdd', $culture, [Globalization.DateTimeStyles]::None, [ref]$date)) {
+        return $date.ToString('yyyy-MM-dd', $culture)
+    }
+    return ''
+}
+
 function Get-DesktopSoftwareInventory {
     [CmdletBinding()]
     param()
@@ -201,6 +211,7 @@ function Get-DesktopSoftwareInventory {
                                     Publisher = [string]$application.GetValue('Publisher')
                                     Scope = $root.Scope
                                     RegistryView = $view
+                                    InstallDate = ConvertFrom-SoftwareInstallDate $application.GetValue('InstallDate')
                                 })
                             }
                             catch { Write-Warning "Could not read software registration $subKeyName : $($_.Exception.Message)" }
@@ -214,7 +225,7 @@ function Get-DesktopSoftwareInventory {
             finally { $baseKey.Dispose() }
         }
     }
-    $rows | Sort-Object Name, Version, Publisher, Scope, RegistryView -Unique
+    $rows | Sort-Object Name, Version, Publisher, Scope, RegistryView, InstallDate -Unique
 }
 
 function New-LocalReportDirectory {
@@ -255,7 +266,7 @@ function Write-OfflineReport {
     param([Parameter(Mandatory = $true)]$Report, [Parameter(Mandatory = $true)][string]$Directory)
     $missingColumns = @('KBArticleIDs', 'Title', 'MsrcSeverity', 'Categories', 'UpdateID', 'RevisionNumber', 'RebootRequired')
     Export-ReportCsv -Rows @($Report.MissingUpdates) -Columns $missingColumns -Path (Join-Path $Directory 'MissingWindowsUpdates.csv')
-    Export-ReportCsv -Rows @($Report.Software) -Columns @('Name', 'Version', 'Publisher', 'Scope', 'RegistryView') -Path (Join-Path $Directory 'InstalledSoftware.csv')
+    Export-ReportCsv -Rows @($Report.Software) -Columns @('Name', 'Version', 'Publisher', 'Scope', 'RegistryView', 'InstallDate') -Path (Join-Path $Directory 'InstalledSoftware.csv')
     Export-ReportCsv -Rows @($Report.ProductResults) -Columns @('Component', 'Before', 'After', 'Target', 'Status', 'Message') -Path (Join-Path $Directory 'ProductUpdates.csv')
     $Report | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $Directory 'SystemInventory.json') -Encoding UTF8
     $summary = 'Missing update count unknown: scan failed or was not completed.'
@@ -280,7 +291,7 @@ function Write-OfflineReport {
     $systemRows.Add([pscustomobject]@{ Field = 'Catalog.LastModifiedUtc'; Value = $Report.Catalog.LastModifiedUtc })
     $systemRows.Add([pscustomobject]@{ Field = 'Catalog.SHA256'; Value = $Report.Catalog.SHA256 })
     $missingTable = ConvertTo-ReportTable 'Missing Windows updates' @($Report.MissingUpdates) ([ordered]@{ KBArticleIDs = 'KB'; Title = 'Update'; MsrcSeverity = 'Severity'; Categories = 'Categories' })
-    $softwareTable = ConvertTo-ReportTable 'Registered desktop software' @($Report.Software) ([ordered]@{ Name = 'Software'; Version = 'Version'; Publisher = 'Publisher'; Scope = 'Scope'; RegistryView = 'Registry view' })
+    $softwareTable = ConvertTo-ReportTable 'Registered desktop software' @($Report.Software) ([ordered]@{ Name = 'Software'; Version = 'Version'; InstallDate = 'Install date'; Publisher = 'Publisher'; Scope = 'Scope'; RegistryView = 'Registry view' })
     $systemTable = ConvertTo-ReportTable 'System and product versions' $systemRows.ToArray() ([ordered]@{ Field = 'Field'; Value = 'Value' })
     $productTable = ConvertTo-ReportTable 'Product update results' @($Report.ProductResults) ([ordered]@{ Component = 'Product'; Before = 'Before'; After = 'After'; Target = 'Package target'; Status = 'Result'; Message = 'Details' })
     $html = @"
@@ -511,12 +522,29 @@ function Assert-OfficeSource {
 }
 
 function Invoke-CheckedProcess {
-    param([string]$FilePath, [string]$Arguments, [string]$WorkingDirectory, [int[]]$SuccessCodes = @(0, 3010, 1641))
+    param([string]$FilePath, [string]$Arguments, [string]$WorkingDirectory, [int[]]$SuccessCodes = @(0, 3010, 1641),
+        [string]$Activity = "Running $([IO.Path]::GetFileName($FilePath))")
     $options = @{ FilePath = $FilePath; ArgumentList = $Arguments; Wait = $true; PassThru = $true; ErrorAction = 'Stop' }
     if ($WorkingDirectory) { $options.WorkingDirectory = $WorkingDirectory }
-    $process = Start-Process @options
-    if ($process.ExitCode -notin $SuccessCodes) { throw "'$FilePath' failed with exit code $($process.ExitCode). Review the local installer logs." }
-    return [int]$process.ExitCode
+    $runner = [powershell]::Create()
+    try {
+        [void]$runner.AddCommand('Microsoft.PowerShell.Management\Start-Process').AddParameters($options)
+        $timer = [Diagnostics.Stopwatch]::StartNew()
+        $operation = $runner.BeginInvoke()
+        do {
+            Write-Progress -Activity $Activity -Status ('Elapsed: {0:hh\:mm\:ss}' -f $timer.Elapsed)
+        } until ($operation.AsyncWaitHandle.WaitOne(1000))
+        $process = @($runner.EndInvoke($operation))
+        if ($runner.HadErrors) { throw $runner.Streams.Error[0] }
+        if ($process.Count -ne 1) { throw "Could not get the exit code for '$FilePath'. Review the local installer logs." }
+        $exitCode = $process[0].ExitCode
+        if ($exitCode -notin $SuccessCodes) { throw "'$FilePath' failed with exit code $exitCode. Review the local installer logs." }
+        return [int]$exitCode
+    }
+    finally {
+        $runner.Dispose()
+        Write-Progress -Activity $Activity -Completed
+    }
 }
 
 function Assert-DeploymentPackage {
@@ -653,18 +681,22 @@ function Wait-UpdatePoll { Start-Sleep -Seconds 2 }
 function Wait-ProductTarget {
     param([string]$Component, $Package, [int]$TimeoutSeconds = 120)
     $timer = [Diagnostics.Stopwatch]::StartNew()
-    do {
-        $inventory = Get-SystemInventory
-        $plan = @(Get-ProductUpdatePlan $inventory $Package | Where-Object { $_.Component -eq $Component })[0]
-        $finished = ($plan.Status -eq 'Current')
-        if ($finished -and $Component -eq 'Office') {
-            $finished = ((Get-ScheduledTask -TaskPath '\Microsoft\Office\' -TaskName 'Office Automatic Updates 2.0' -ErrorAction Stop).State -ne 'Running')
-        }
-        if ($finished) { return $inventory }
-        if ($timer.Elapsed.TotalSeconds -ge $TimeoutSeconds) { throw "$Component did not reach the packaged target version within $TimeoutSeconds seconds. Verification is required; success was NOT assumed." }
-        Write-Progress -Activity "Waiting for $Component update" -Status ("Elapsed: {0}s" -f [int]$timer.Elapsed.TotalSeconds)
-        Wait-UpdatePoll
-    } while ($true)
+    $activity = "Waiting for $Component update"
+    try {
+        do {
+            Write-Progress -Activity $activity -Status ('Elapsed: {0:hh\:mm\:ss}' -f $timer.Elapsed)
+            $inventory = Get-SystemInventory
+            $plan = @(Get-ProductUpdatePlan $inventory $Package | Where-Object { $_.Component -eq $Component })[0]
+            $finished = ($plan.Status -eq 'Current')
+            if ($finished -and $Component -eq 'Office') {
+                $finished = ((Get-ScheduledTask -TaskPath '\Microsoft\Office\' -TaskName 'Office Automatic Updates 2.0' -ErrorAction Stop).State -ne 'Running')
+            }
+            if ($finished) { return $inventory }
+            if ($timer.Elapsed.TotalSeconds -ge $TimeoutSeconds) { throw "$Component did not reach the packaged target version within $TimeoutSeconds seconds. Verification is required; success was NOT assumed." }
+            Wait-UpdatePoll
+        } while ($true)
+    }
+    finally { Write-Progress -Activity $activity -Completed }
 }
 
 function Invoke-OfficeLocalUpdate {
@@ -688,7 +720,7 @@ function Invoke-OfficeLocalUpdate {
     $settings = @(Save-OfficeUpdateSettings)
     $settings | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $Directory 'OfficeSettingsBefore.json') -Encoding UTF8
     try {
-        [void](Invoke-CheckedProcess (Resolve-PackagePath $Root $Package.Office.SetupPath) "/configure `"$configuration`"" $Directory @(0))
+        [void](Invoke-CheckedProcess (Resolve-PackagePath $Root $Package.Office.SetupPath) "/configure `"$configuration`"" $Directory @(0) -Activity 'Configuring Office offline update')
         Start-ScheduledTask -TaskPath '\Microsoft\Office\' -TaskName 'Office Automatic Updates 2.0' -ErrorAction Stop
         [void](Wait-ProductTarget -Component Office -Package $Package -TimeoutSeconds $TimeoutSeconds)
     }
@@ -705,13 +737,27 @@ function Invoke-LocalProductUpdates {
         if ($result.Status -eq 'Blocked') { $stop = $true; continue }
         if ($result.Status -ne 'Required') { continue }
         try {
+            $processNames = switch ($result.Component) {
+                'Edge' { 'msedge' }
+                'Office' { 'WINWORD', 'EXCEL', 'OUTLOOK', 'POWERPNT', 'MSACCESS', 'MSPUB', 'ONENOTE', 'VISIO', 'WINPROJ' }
+            }
+            if ($processNames) {
+                $applications = @(Get-Process -Name $processNames -ErrorAction SilentlyContinue)
+                if ($applications.Count -gt 0) {
+                    $names = ($applications.ProcessName | Sort-Object -Unique) -join ', '
+                    $result.Status = 'Blocked'
+                    $result.Message = "Close the listed $($result.Component) processes ($names), then run Update and Report again. Nothing was force-closed."
+                    Write-Warning "$($result.Component): $($result.Message)"
+                    continue
+                }
+            }
             Write-Host "Updating $($result.Component)..."
             $exitCode = switch ($result.Component) {
-                'Defender' { Invoke-CheckedProcess (Resolve-PackagePath $Root $Package.Defender.Path) '/q' $Directory }
+                'Defender' { Invoke-CheckedProcess (Resolve-PackagePath $Root $Package.Defender.Path) '/q' $Directory -Activity 'Installing Defender update' }
                 'Edge' {
                     $installer = Resolve-PackagePath $Root $Package.Edge.Path
                     $log = Join-Path $Directory 'EdgeInstaller.log'
-                    Invoke-CheckedProcess "$env:SystemRoot\System32\msiexec.exe" "/i `"$installer`" /qn /norestart REBOOT=ReallySuppress /L*v `"$log`"" $Directory
+                    Invoke-CheckedProcess "$env:SystemRoot\System32\msiexec.exe" "/i `"$installer`" /qn /norestart REBOOT=ReallySuppress /L*v `"$log`"" $Directory -Activity 'Installing Edge update'
                 }
                 'Office' { Invoke-OfficeLocalUpdate $Root $Directory $Package $Inventory }
             }
@@ -749,8 +795,6 @@ function Invoke-OfflineMaintenance {
             if ($inventory.PendingReboot.Any) { throw 'A reboot is pending. Restart manually before installing products; this run will report only.' }
             $drive = New-Object IO.DriveInfo ([IO.Path]::GetPathRoot($env:SystemRoot))
             if ($drive.AvailableFreeSpace -lt 8GB) { throw 'At least 8 GB free is required on the system drive before installing products.' }
-            $applications = @(Get-Process -Name WINWORD, EXCEL, OUTLOOK, POWERPNT, MSACCESS, MSPUB, ONENOTE, VISIO, WINPROJ, msedge -ErrorAction SilentlyContinue)
-            if ($applications.Count -gt 0) { throw 'Save your work and close all Office and Edge processes, including background processes, then run Update and Report again. Nothing was force-closed.' }
             $results = @(Invoke-LocalProductUpdates $Root $Directory $package $inventory)
             foreach ($result in $results | Where-Object { $_.Status -in @('Failed', 'Blocked', 'Unsupported', 'RebootRequired', 'NotRun') }) { $issues += "$($result.Component): $($result.Status). $($result.Message)" }
         }

@@ -67,18 +67,19 @@ try {
     $setup = Join-Path $staging $setupPath
 
     Write-Host '[5/5] Downloading complete Office LTSC 2021 and 2024 en-US sources (several GB)...'
-    Write-Host 'Office download progress is recorded by the Office Deployment Tool. Do not close this window.'
+    Write-Host 'Elapsed time is shown while the Office Deployment Tool runs. Do not close this window.'
     $officeReleases = @(foreach ($release in Get-OfficeReleaseDefinitions) {
         $officeVersion = ''
         $sourceRoot = "30-Office\Source\$($release.Year)"
         foreach ($architecture in @('x86', 'x64')) {
-            Write-Host "Downloading Office LTSC $($release.Year) $architecture..."
+            $activity = "Downloading Office LTSC $($release.Year) $architecture"
+            Write-Host "$activity..."
             $edition = if ($architecture -eq 'x86') { '32' } else { '64' }
             $source = Join-Path $staging "$sourceRoot\$architecture"
             [void](New-Item -ItemType Directory -Path $source -Force)
             $configuration = Join-Path $work "Download-$($release.Year)-$architecture.xml"
             New-OfficeDownloadConfiguration -Path $configuration -SourcePath $source -Edition $edition -Release $release -Version $officeVersion
-            [void](Invoke-CheckedProcess -FilePath $setup -Arguments "/download `"$configuration`"" -WorkingDirectory $work -SuccessCodes @(0))
+            [void](Invoke-CheckedProcess -FilePath $setup -Arguments "/download `"$configuration`"" -WorkingDirectory $work -SuccessCodes @(0) -Activity $activity)
             if (-not $officeVersion) {
                 $versions = @(Get-ChildItem -LiteralPath (Join-Path $source 'Office\Data') -Directory | Where-Object { $_.Name -match '^16\.0\.\d+\.\d+$' })
                 if ($versions.Count -ne 1) { throw "Could not identify one complete Office LTSC $($release.Year) build from the fresh x86 download." }

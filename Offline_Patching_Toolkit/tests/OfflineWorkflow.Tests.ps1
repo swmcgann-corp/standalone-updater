@@ -112,6 +112,31 @@ Describe 'Offline report safety' {
         $html | Should -Match 'tabindex="0"'
     }
 
+    It 'shows only valid registered install dates in the software inventory' {
+        InModuleScope OfflineUpdate.Common {
+            ConvertFrom-SoftwareInstallDate '20261118' | Should -Be '2026-11-18'
+            ConvertFrom-SoftwareInstallDate '20260230' | Should -Be ''
+            ConvertFrom-SoftwareInstallDate $null | Should -Be ''
+        }
+        $report = [pscustomobject]@{
+            ComputerName = 'TEST-PC'; Timestamp = '2026-11-19'; Inventory = $null
+            Catalog = [pscustomobject]@{ DownloadedUtc = ''; LastModifiedUtc = ''; SHA256 = '' }
+            Scan = [pscustomobject]@{ Status = 'Succeeded'; Message = ''; MissingCount = 0 }
+            MissingUpdates = @(); ProductResults = @(); Warnings = @()
+            Software = @(
+                [pscustomobject]@{ Name = 'Registered'; Version = '1'; Publisher = ''; Scope = 'Machine'; RegistryView = 'Registry64'; InstallDate = '2026-11-18' }
+                [pscustomobject]@{ Name = 'Undated'; Version = '2'; Publisher = ''; Scope = 'Machine'; RegistryView = 'Registry64'; InstallDate = '' }
+            )
+        }
+        Write-OfflineReport -Report $report -Directory $TestDrive
+        $software = Import-Csv (Join-Path $TestDrive 'InstalledSoftware.csv')
+        $software[0].InstallDate | Should -Be '2026-11-18'
+        $software[1].InstallDate | Should -Be ''
+        $html = Get-Content (Join-Path $TestDrive 'OfflineUpdateReport.html') -Raw
+        $html | Should -Match '<th scope="col">Install date</th>'
+        $html | Should -Match '<td>2026-11-18</td>'
+    }
+
     It 'never presents a failed scan as zero missing updates' {
         $report = [pscustomobject]@{
             ComputerName = 'TEST-PC'; Timestamp = '2026-11-17'; Inventory = $null
@@ -279,6 +304,27 @@ Describe 'Package preparation contracts' {
         InModuleScope OfflineUpdate.Common {
             Mock Get-AuthenticodeSignature { [pscustomobject]@{ Status = 'Valid'; SignerCertificate = [pscustomobject]@{ Subject = 'CN=Example, O=Example Corporation, C=US' } } }
             { Assert-MicrosoftSignature 'fake.exe' } | Should -Throw '*Microsoft signature validation failed*'
+        }
+    }
+}
+
+Describe 'Native process progress' {
+    It 'shows and clears elapsed progress while preserving the installer exit code' {
+        InModuleScope OfflineUpdate.Common {
+            Mock Write-Progress {}
+            $command = Join-Path $env:SystemRoot 'System32\cmd.exe'
+            Invoke-CheckedProcess $command '/d /c exit 23' $TestDrive @(23) -Activity 'Test process' | Should -Be 23
+            Should -Invoke Write-Progress -ParameterFilter { $Activity -eq 'Test process' -and $Status -match '^Elapsed:' -and -not $Completed }
+            Should -Invoke Write-Progress -Times 1 -Exactly -ParameterFilter { $Activity -eq 'Test process' -and $Completed }
+        }
+    }
+
+    It 'clears progress and reports failure for an unaccepted exit code' {
+        InModuleScope OfflineUpdate.Common {
+            Mock Write-Progress {}
+            $command = Join-Path $env:SystemRoot 'System32\cmd.exe'
+            { Invoke-CheckedProcess $command '/d /c exit 23' $TestDrive } | Should -Throw '*exit code 23*'
+            Should -Invoke Write-Progress -Times 1 -Exactly -ParameterFilter { $Activity -eq 'Running cmd.exe' -and $Completed }
         }
     }
 }
@@ -455,6 +501,34 @@ Describe 'Installed product selection' {
         (Get-ProductUpdatePlan $state.Inventory $state.Package | Where-Object Component -EQ Office).Status | Should -Be 'Unsupported'
     }
 
+    It 'limits the effect of a running <RunningProcess> process' -TestCases @(
+        @{ RunningProcess = 'msedge'; BlockedComponent = 'Edge' }
+        @{ RunningProcess = 'WINWORD'; BlockedComponent = 'Office' }
+        @{ RunningProcess = 'OfficeClickToRun'; BlockedComponent = '' }
+    ) {
+        param($RunningProcess, $BlockedComponent)
+        InModuleScope OfflineUpdate.Common -Parameters @{ Fixture = (New-TestState); RunningProcess = $RunningProcess; BlockedComponent = $BlockedComponent } {
+            param($Fixture, $RunningProcess, $BlockedComponent)
+            Mock Get-Process { if ($Name -contains $RunningProcess) { [pscustomobject]@{ ProcessName = $RunningProcess } } }
+            Mock Invoke-CheckedProcess { 0 }
+            Mock Invoke-OfficeLocalUpdate { 0 }
+            Mock Wait-ProductTarget { $Fixture.Inventory }
+            $results = @(Invoke-LocalProductUpdates $TestDrive $TestDrive $Fixture.Package $Fixture.Inventory)
+            $results.Count | Should -Be 3
+            foreach ($result in $results) {
+                if ($result.Component -eq $BlockedComponent) {
+                    $result.Status | Should -Be 'Blocked'
+                    $result.Message | Should -Match $RunningProcess
+                }
+                else { $result.Status | Should -Be 'Updated' }
+            }
+            $expectedOfficeCalls = if ($BlockedComponent -eq 'Office') { 0 } else { 1 }
+            Should -Invoke Invoke-OfficeLocalUpdate -Times $expectedOfficeCalls -Exactly
+            $expectedInstallerCalls = if ($BlockedComponent -eq 'Edge') { 1 } else { 2 }
+            Should -Invoke Invoke-CheckedProcess -Times $expectedInstallerCalls -Exactly
+        }
+    }
+
     It 'stops further installers after the first product fails' {
         $state = New-TestState
         InModuleScope OfflineUpdate.Common -Parameters @{ Fixture = $state } {
@@ -492,8 +566,10 @@ Describe 'Installed product selection' {
             param($Fixture)
             Mock Get-SystemInventory { $Fixture.Inventory }
             Mock Wait-UpdatePoll { throw 'A zero-timeout test must not sleep' }
+            Mock Write-Progress {}
             { Wait-ProductTarget -Component Edge -Package $Fixture.Package -TimeoutSeconds 0 } | Should -Throw '*NOT assumed*'
             Should -Invoke Wait-UpdatePoll -Times 0 -Exactly
+            Should -Invoke Write-Progress -Times 1 -Exactly -ParameterFilter { $Activity -eq 'Waiting for Edge update' -and $Completed }
         }
     }
 }

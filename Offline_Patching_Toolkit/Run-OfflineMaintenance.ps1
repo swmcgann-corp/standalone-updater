@@ -38,7 +38,7 @@ if ($Mode -eq 'Menu') {
 if (-not $PSCmdlet.ShouldProcess($PSScriptRoot, $Mode)) { return }
 if ($Mode -eq 'UpdateAndReport') {
     Write-Host 'Save your work, close Office and Edge completely, and confirm an approved backup/maintenance window is available.'
-    if ((Read-Host 'Type UPDATE to start product updates; anything else cancels') -cne 'UPDATE') { Write-Host 'Cancelled. Nothing was installed.'; return }
+    if ((Read-Host 'Press Enter to start product updates; type anything to cancel') -cne '') { Write-Host 'Cancelled. Nothing was installed.'; return }
 }
 Import-Module (Join-Path $PSScriptRoot '00-Control\OfflineUpdate.Common.psm1') -Force -DisableNameChecking
 $directory = New-LocalReportDirectory -BaseDirectory $OutputDirectory
