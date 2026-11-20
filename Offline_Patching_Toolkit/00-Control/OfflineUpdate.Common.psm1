@@ -505,8 +505,25 @@ function New-OfficeDownloadConfiguration {
     $document.Save($Path)
 }
 
+function Get-OfficeCabinetBuild {
+    param([string]$Path)
+    $tempDirectory = Join-Path ([IO.Path]::GetTempPath()) "StandaloneUpdaterCab-$([guid]::NewGuid().ToString('N'))"
+    [void](New-Item -ItemType Directory -Path $tempDirectory -ErrorAction Stop)
+    try {
+        & "$env:SystemRoot\System32\expand.exe" -F:VersionDescriptor.xml $Path $tempDirectory | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Could not extract the Office version descriptor (exit $LASTEXITCODE)." }
+        $descriptor = New-Object Xml.XmlDocument
+        $descriptor.XmlResolver = $null
+        $descriptor.Load((Join-Path $tempDirectory 'VersionDescriptor.xml'))
+        $build = $descriptor.SelectSingleNode('/Version/Available/@Build')
+        if ($null -eq $build -or -not $build.Value) { throw 'The Office version descriptor has no available build.' }
+        return $build.Value
+    }
+    finally { Remove-Item -LiteralPath $tempDirectory -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
 function Assert-OfficeSource {
-    param([string]$SourcePath, [ValidateSet('x86', 'x64')][string]$Architecture, [string]$Version)
+    param([string]$SourcePath, [ValidateSet('x86', 'x64')][string]$Architecture, [string]$Version, [switch]$RequireRollingCabinet)
     $parsedVersion = $null
     if (-not [version]::TryParse($Version, [ref]$parsedVersion)) { throw "Invalid Office source version: $Version" }
     $bitness = if ($Architecture -eq 'x86') { '32' } else { '64' }
@@ -517,6 +534,18 @@ function Assert-OfficeSource {
         $file = Join-Path $SourcePath $relative
         if (-not (Test-Path -LiteralPath $file -PathType Leaf) -or (Get-Item -LiteralPath $file).Length -eq 0) {
             throw "Office $Architecture source is incomplete; required file missing or empty: $relative"
+        }
+    }
+    if ($RequireRollingCabinet) {
+        $rollingCabinet = "Office\Data\v$bitness.cab"
+        $rollingPath = Join-Path $SourcePath $rollingCabinet
+        if (-not (Test-Path -LiteralPath $rollingPath -PathType Leaf)) {
+            throw "Office $Architecture offline update source is missing $rollingCabinet. Prepare a fresh package on the connected PC."
+        }
+        try { $availableBuild = Get-OfficeCabinetBuild $rollingPath }
+        catch { throw "Cannot read Office $Architecture update metadata from $rollingCabinet. Prepare a fresh package on the connected PC. $($_.Exception.Message)" }
+        if ($availableBuild -ne $Version) {
+            throw "Office $Architecture update metadata in $rollingCabinet advertises $availableBuild, which does not match $Version. Prepare a fresh package on the connected PC."
         }
     }
 }
@@ -692,7 +721,20 @@ function Wait-ProductTarget {
                 $finished = ((Get-ScheduledTask -TaskPath '\Microsoft\Office\' -TaskName 'Office Automatic Updates 2.0' -ErrorAction Stop).State -ne 'Running')
             }
             if ($finished) { return $inventory }
-            if ($timer.Elapsed.TotalSeconds -ge $TimeoutSeconds) { throw "$Component did not reach the packaged target version within $TimeoutSeconds seconds. Verification is required; success was NOT assumed." }
+            if ($timer.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+                $message = "$Component did not reach the packaged target version within $TimeoutSeconds seconds. Verification is required; success was NOT assumed."
+                if ($Component -eq 'Office') {
+                    $message = "Office update could not be verified within $TimeoutSeconds seconds. Last observed build: $($plan.Before); packaged target: $($plan.Target)."
+                    try {
+                        $task = Get-ScheduledTask -TaskPath '\Microsoft\Office\' -TaskName 'Office Automatic Updates 2.0' -ErrorAction Stop
+                        $message += " Office Automatic Updates 2.0 state: $($task.State)."
+                        $taskInfo = Get-ScheduledTaskInfo -TaskPath '\Microsoft\Office\' -TaskName 'Office Automatic Updates 2.0' -ErrorAction Stop
+                        $message += ' Last run: {0:yyyy-MM-dd HH:mm:ss}; task result: 0x{1:X8}.' -f $taskInfo.LastRunTime, $taskInfo.LastTaskResult
+                    }
+                    catch { $message += " Task diagnostics unavailable: $($_.Exception.Message)" }
+                }
+                throw $message
+            }
             Wait-UpdatePoll
         } while ($true)
     }
@@ -714,7 +756,7 @@ function Invoke-OfficeLocalUpdate {
     if ((Get-Service -Name ClickToRunSvc -ErrorAction Stop).Status -ne 'Running') { throw 'Office Click-to-Run service is not running. Ask IT to restore normal Office servicing, then retry.' }
     $relative = if ($Inventory.Office.Platform -eq 'x86') { $release.X86Path } else { $release.X64Path }
     $source = Resolve-PackagePath $Root $relative
-    Assert-OfficeSource $source $Inventory.Office.Platform $release.Version
+    Assert-OfficeSource $source $Inventory.Office.Platform $release.Version -RequireRollingCabinet
     $configuration = Join-Path $Directory 'Office-LocalUpdate.xml'
     New-OfficeUpdateConfiguration $configuration $source $release.Version $release.Channel
     $settings = @(Save-OfficeUpdateSettings)
@@ -743,6 +785,9 @@ function Invoke-LocalProductUpdates {
             }
             if ($processNames) {
                 $applications = @(Get-Process -Name $processNames -ErrorAction SilentlyContinue)
+                if ($result.Component -eq 'Edge') {
+                    $applications = @($applications | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero })
+                }
                 if ($applications.Count -gt 0) {
                     $names = ($applications.ProcessName | Sort-Object -Unique) -join ', '
                     $result.Status = 'Blocked'
@@ -757,7 +802,7 @@ function Invoke-LocalProductUpdates {
                 'Edge' {
                     $installer = Resolve-PackagePath $Root $Package.Edge.Path
                     $log = Join-Path $Directory 'EdgeInstaller.log'
-                    Invoke-CheckedProcess "$env:SystemRoot\System32\msiexec.exe" "/i `"$installer`" /qn /norestart REBOOT=ReallySuppress /L*v `"$log`"" $Directory -Activity 'Installing Edge update'
+                    Invoke-CheckedProcess "$env:SystemRoot\System32\msiexec.exe" "/i `"$installer`" /qn /norestart REBOOT=ReallySuppress MSIRESTARTMANAGERCONTROL=Disable /L*v `"$log`"" $Directory -Activity 'Installing Edge update'
                 }
                 'Office' { Invoke-OfficeLocalUpdate $Root $Directory $Package $Inventory }
             }
@@ -777,6 +822,28 @@ function Invoke-LocalProductUpdates {
         catch { $result.Status = 'Failed'; $result.Message = $_.Exception.Message; $stop = $true }
     }
     return $results
+}
+
+function Write-ProductUpdateSummary {
+    param([ValidateSet('UpdateAndReport', 'VerifyOnly')][string]$Mode, [object[]]$Results)
+    if ($Mode -eq 'VerifyOnly') {
+        Write-Host 'Verify Only: no product updates were attempted.'
+        return
+    }
+    if (-not $Results) {
+        Write-Warning 'No product update results. Check the report for package verification or maintenance errors.'
+        return
+    }
+    foreach ($result in $Results) {
+        $status = "$($result.Component): $($result.Status)"
+        if ($result.Before -and $result.Target) {
+            $status += " (before: $($result.Before); package target: $($result.Target))"
+        }
+        if ($result.Status -eq 'Updated') { $status += " (verified after: $($result.After))" }
+        $message = "$status. $($result.Message)"
+        if ($result.Status -in @('Failed', 'Blocked', 'Unsupported', 'RebootRequired', 'NotRun')) { Write-Warning $message }
+        else { Write-Host $message }
+    }
 }
 
 function Invoke-OfflineMaintenance {

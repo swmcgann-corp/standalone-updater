@@ -16,7 +16,7 @@ Allow **25 GB free** on the output drive. Downloads include the scan catalog, De
 
 Copy the **entire ready folder** onto the standalone PC using approved transfer media. Do not change its contents.
 
-Confirm a backup is available, save your work, and close Office and Edge. Double-click [Start-OfflineUpdate.cmd](Start-OfflineUpdate.cmd) and approve the administrator prompt.
+Confirm a backup is available, save your work, and close Office apps and any open Edge windows. Double-click [Start-OfflineUpdate.cmd](Start-OfflineUpdate.cmd) and approve the administrator prompt.
 
 ## 3. Update and review
 
@@ -24,9 +24,13 @@ Choose **1 - Update and Report**, review the warning, and press **Enter** to pro
 
 The tool updates Defender, Edge, and Office, scans for missing Windows patches, and opens **OfflineUpdateReport.html** with the patch list and software versions. The same package works on both Office releases: it selects the installed edition, update channel, and bitness without migrating Office or changing its licensing.
 
-Running Edge or Office apps block only their own update. Close the processes listed for the blocked product and retry. Leave the Office Click-to-Run service running.
+Open Edge windows and running Office apps block only their own update. Edge background processes without a window do not block the installer, and the toolkit does not terminate them or change Edge settings. If the installer requests a restart, restart manually. Leave the Office Click-to-Run service running.
 
 Product installers and version checks show their current activity and elapsed time. Wait for the report before treating an update as complete.
+
+Check **Product update results** in the HTML report or open `ProductUpdates.csv` in the same folder. A successful Windows scan does not mean Office was updated. `Current` means the installed build already met or exceeded the dated package target; no installer was run. `Verify Only` doesn't attempt product updates, so it has no update-result rows.
+
+If a v1.0.0 package times out updating 64-bit Office LTSC 2021 or 2024, prepare a new package with the current toolkit. Some v1.0.0 packages lack the `v64.cab` metadata used to discover updates. Do not edit the existing ready folder or its manifest. After the run, Office's **Update Now** checks its normal configured source, not the toolkit package. To verify the installed build independently, run **Verify Only** and compare the reported Office version with the target from **Update and Report**.
 
 If a restart is requested, restart manually and choose **Update and Report** again to finish. If an update fails, resolve the reported error before continuing.
 

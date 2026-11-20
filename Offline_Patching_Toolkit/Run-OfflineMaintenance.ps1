@@ -37,7 +37,7 @@ if ($Mode -eq 'Menu') {
 }
 if (-not $PSCmdlet.ShouldProcess($PSScriptRoot, $Mode)) { return }
 if ($Mode -eq 'UpdateAndReport') {
-    Write-Host 'Save your work, close Office and Edge completely, and confirm an approved backup/maintenance window is available.'
+    Write-Host 'Save your work, close Office apps and open Edge windows, and confirm an approved backup/maintenance window is available.'
     if ((Read-Host 'Press Enter to start product updates; type anything to cancel') -cne '') { Write-Host 'Cancelled. Nothing was installed.'; return }
 }
 Import-Module (Join-Path $PSScriptRoot '00-Control\OfflineUpdate.Common.psm1') -Force -DisableNameChecking
@@ -50,6 +50,7 @@ try {
     Write-Host 'Package verification and the offline Windows scan may take several minutes.'
     $report = Invoke-OfflineMaintenance -Mode $Mode -Root $PSScriptRoot -Directory $directory
     Write-Host "Scan: $($report.Scan.Status)"
+    Write-ProductUpdateSummary -Mode $Mode -Results $report.ProductResults
     Write-Host "Report: $($report.ReportPath)"
     $failures = @($report.ProductResults | Where-Object { $_.Status -in @('Failed', 'Blocked', 'Unsupported') })
     if ($report.Scan.Status -ne 'Succeeded' -or $failures.Count -gt 0) { $exitCode = 1 }

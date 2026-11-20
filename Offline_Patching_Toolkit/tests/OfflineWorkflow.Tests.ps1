@@ -186,9 +186,10 @@ Describe 'Package preparation contracts' {
         Resolve-PackagePath $TestDrive 'Office files\setup.exe' | Should -Be (Join-Path $TestDrive 'Office files\setup.exe')
     }
 
-    It 'creates correctly escaped Office LTSC <Year> download XML and pins an explicit build' -TestCases @(
+    It 'creates correctly escaped Office LTSC <Year> download XML for build "<Version>"' -TestCases @(
         @{ Year = '2021'; Bitness = '32'; Version = '16.0.14334.21048' }
         @{ Year = '2024'; Bitness = '64'; Version = '16.0.17932.21140' }
+        @{ Year = '2024'; Bitness = '64'; Version = '' }
     ) {
         param($Year, $Bitness, $Version)
         $path = Join-Path $TestDrive 'office.xml'
@@ -197,7 +198,8 @@ Describe 'Package preparation contracts' {
         [xml]$xml = Get-Content -LiteralPath $path -Raw
         $xml.Configuration.Add.SourcePath | Should -Be 'C:\Office & files'
         $xml.Configuration.Add.OfficeClientEdition | Should -Be $Bitness
-        $xml.Configuration.Add.Version | Should -Be $Version
+        $xml.Configuration.Add.HasAttribute('Version') | Should -Be ([bool]$Version)
+        $xml.Configuration.Add.GetAttribute('Version') | Should -Be $Version
         $xml.Configuration.Add.Channel | Should -Be "PerpetualVL$Year"
         $xml.Configuration.Add.Product.ID | Should -Be "ProPlus${Year}Volume"
         $xml.Configuration.Add.Product.Language.ID | Should -Be 'en-us'
@@ -206,6 +208,37 @@ Describe 'Package preparation contracts' {
 
     It 'rejects an incomplete Office source' {
         { Assert-OfficeSource $TestDrive 'x64' '16.0.1.2' } | Should -Throw '*incomplete*'
+    }
+
+    It 'requires the rolling <Architecture> update cabinet to match the packaged build' -TestCases @(
+        @{ Architecture = 'x86'; Bitness = '32' }, @{ Architecture = 'x64'; Bitness = '64' }
+    ) {
+        param($Architecture, $Bitness)
+        $source = Join-Path $TestDrive $Architecture
+        $version = '16.0.17932.21140'
+        [void](New-Item -ItemType Directory -Path (Join-Path $source "Office\Data\$version") -Force)
+        $catalog = Join-Path $source "Office\Data\v${Bitness}_$version.cab"
+        Set-Content -LiteralPath $catalog -Value 'versioned cabinet'
+        foreach ($language in @('x-none', 'en-us')) {
+            $stream = Join-Path $source "Office\Data\$version\stream.$Architecture.$language.dat"
+            Set-Content -LiteralPath $stream -Value 'stream'
+            Set-Content -LiteralPath "$stream.cat" -Value 'catalog'
+        }
+        $rolling = Join-Path $source "Office\Data\v$Bitness.cab"
+        { Assert-OfficeSource $source $Architecture $version -RequireRollingCabinet } | Should -Throw "*missing *v$Bitness.cab*"
+        $descriptor = Join-Path $source 'VersionDescriptor.xml'
+        $directives = Join-Path $source 'descriptor.ddf'
+        @('.Set Cabinet=on', ".Set CabinetNameTemplate=v$Bitness.cab", ".Set DiskDirectory1=`"$(Split-Path $rolling -Parent)`"",
+            ".Set InfFileName=`"$(Join-Path $source 'cab.inf')`"", ".Set RptFileName=`"$(Join-Path $source 'cab.rpt')`"",
+            "`"$descriptor`"", "`"$catalog`"") | Set-Content -LiteralPath $directives -Encoding ASCII
+        foreach ($build in @('16.0.17932.20670', $version)) {
+            Set-Content -LiteralPath $descriptor -Encoding ASCII -Value "<Version><Available Build=`"$build`" /></Version>"
+            & "$env:SystemRoot\System32\makecab.exe" /F $directives | Out-Null
+            $LASTEXITCODE | Should -Be 0
+            if ($build -eq $version) { { Assert-OfficeSource $source $Architecture $version -RequireRollingCabinet } | Should -Not -Throw }
+            else { { Assert-OfficeSource $source $Architecture $version -RequireRollingCabinet } | Should -Throw "*does not match $version*" }
+            Remove-Item -LiteralPath $rolling
+        }
     }
 
     It 'verifies both releases and rejects a missing Office 2024 source file even with a matching manifest' {
@@ -330,6 +363,43 @@ Describe 'Native process progress' {
 }
 
 Describe 'Offline mode separation' {
+    It 'states that Verify Only did not attempt product updates' {
+        InModuleScope OfflineUpdate.Common {
+            Mock Write-Host {}
+            Mock Write-Warning {}
+            Write-ProductUpdateSummary -Mode VerifyOnly -Results @()
+            Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter { $Object -eq 'Verify Only: no product updates were attempted.' }
+            Should -Invoke Write-Warning -Times 0 -Exactly
+        }
+    }
+
+    It 'shows why Office 2021 was already current without implying that an installer ran' {
+        $state = New-TestState
+        $state.Package.Office = New-TestMixedOfficePackage
+        $state.Inventory.Office.Version = '16.0.14334.21048'
+        $office = Get-ProductUpdatePlan $state.Inventory $state.Package | Where-Object Component -EQ Office
+        InModuleScope OfflineUpdate.Common -Parameters @{ OfficeResult = $office } {
+            param($OfficeResult)
+            Mock Write-Host {}
+            Write-ProductUpdateSummary -Mode UpdateAndReport -Results @($OfficeResult)
+            Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter {
+                $Object -like 'Office: Current (before: 16.0.14334.21048; package target: 16.0.14334.21048).*no installer was run*'
+            }
+        }
+    }
+
+    It 'warns when Office was not run and includes the reason from the report' {
+        InModuleScope OfflineUpdate.Common {
+            Mock Write-Warning {}
+            $office = [pscustomobject]@{
+                Component = 'Office'; Status = 'NotRun'; Before = '16.0.14334.21000'; Target = '16.0.14334.21048'
+                Message = 'Stopped after a failure or reboot requirement.'
+            }
+            Write-ProductUpdateSummary -Mode UpdateAndReport -Results @($office)
+            Should -Invoke Write-Warning -Times 1 -Exactly -ParameterFilter { $Message -like 'Office: NotRun*Stopped after a failure or reboot requirement*' }
+        }
+    }
+
     It 'runs no product installers in VerifyOnly mode' {
         InModuleScope OfflineUpdate.Common {
             Mock Assert-DeploymentPackage { [pscustomobject]@{ Catalog = [pscustomobject]@{ Path = '10-Scan\wsusscn2.cab' } } }
@@ -398,8 +468,25 @@ Describe 'Office update configuration safety' {
             $xml.Configuration.Updates.TargetVersion | Should -Be '16.0.17932.21140'
             $xml.Configuration.Updates.Channel | Should -Be 'PerpetualVL2024'
             $xml.Configuration.ChildNodes.Count | Should -Be 1
+            Should -Invoke Assert-OfficeSource -Times 1 -Exactly -ParameterFilter { $RequireRollingCabinet }
             Should -Invoke Start-ScheduledTask -Times 1 -Exactly
             Should -Invoke Restore-OfficeUpdateSettings -Times 1 -Exactly
+        }
+    }
+
+    It 'reports the observed Office build and task result without treating task completion as success' {
+        $state = New-TestState
+        $state.Package.Office = New-TestMixedOfficePackage
+        $state.Inventory.Office.ProductReleaseIds = 'ProPlus2024Volume'
+        $state.Inventory.Office.Channel = 'PerpetualVL2024'
+        $state.Inventory.Office.Version = '16.0.17932.20670'
+        InModuleScope OfflineUpdate.Common -Parameters @{ Fixture = $state } {
+            param($Fixture)
+            Mock Get-SystemInventory { $Fixture.Inventory }
+            Mock Get-ScheduledTask { [pscustomobject]@{ State = 'Ready' } }
+            Mock Get-ScheduledTaskInfo { [pscustomobject]@{ LastRunTime = [datetime]'2026-11-20T14:00:00'; LastTaskResult = 0 } }
+            { Wait-ProductTarget Office $Fixture.Package -TimeoutSeconds 0 } |
+                Should -Throw '*Last observed build: 16.0.17932.20670; packaged target: 16.0.17932.21140*state: Ready*Last run: 2026-11-20 14:00:00; task result: 0x00000000*'
         }
     }
 
@@ -501,15 +588,21 @@ Describe 'Installed product selection' {
         (Get-ProductUpdatePlan $state.Inventory $state.Package | Where-Object Component -EQ Office).Status | Should -Be 'Unsupported'
     }
 
-    It 'limits the effect of a running <RunningProcess> process' -TestCases @(
-        @{ RunningProcess = 'msedge'; BlockedComponent = 'Edge' }
-        @{ RunningProcess = 'WINWORD'; BlockedComponent = 'Office' }
-        @{ RunningProcess = 'OfficeClickToRun'; BlockedComponent = '' }
+    It 'limits the effect of <Scenario>' -TestCases @(
+        @{ Scenario = 'background Edge'; RunningProcess = 'msedge'; HasWindow = $false; BlockedComponent = '' }
+        @{ Scenario = 'an open Edge window'; RunningProcess = 'msedge'; HasWindow = $true; BlockedComponent = 'Edge' }
+        @{ Scenario = 'running Word'; RunningProcess = 'WINWORD'; HasWindow = $false; BlockedComponent = 'Office' }
+        @{ Scenario = 'the Office Click-to-Run service'; RunningProcess = 'OfficeClickToRun'; HasWindow = $false; BlockedComponent = '' }
     ) {
-        param($RunningProcess, $BlockedComponent)
-        InModuleScope OfflineUpdate.Common -Parameters @{ Fixture = (New-TestState); RunningProcess = $RunningProcess; BlockedComponent = $BlockedComponent } {
-            param($Fixture, $RunningProcess, $BlockedComponent)
-            Mock Get-Process { if ($Name -contains $RunningProcess) { [pscustomobject]@{ ProcessName = $RunningProcess } } }
+        param($RunningProcess, $HasWindow, $BlockedComponent)
+        InModuleScope OfflineUpdate.Common -Parameters @{ Fixture = (New-TestState); RunningProcess = $RunningProcess; HasWindow = $HasWindow; BlockedComponent = $BlockedComponent } {
+            param($Fixture, $RunningProcess, $HasWindow, $BlockedComponent)
+            Mock Get-Process {
+                if ($Name -contains $RunningProcess) {
+                    [pscustomobject]@{ ProcessName = $RunningProcess; MainWindowHandle = [IntPtr]([int]$HasWindow) }
+                }
+            }
+            Mock Stop-Process { throw 'No product process should be force-closed' }
             Mock Invoke-CheckedProcess { 0 }
             Mock Invoke-OfficeLocalUpdate { 0 }
             Mock Wait-ProductTarget { $Fixture.Inventory }
@@ -526,6 +619,11 @@ Describe 'Installed product selection' {
             Should -Invoke Invoke-OfficeLocalUpdate -Times $expectedOfficeCalls -Exactly
             $expectedInstallerCalls = if ($BlockedComponent -eq 'Edge') { 1 } else { 2 }
             Should -Invoke Invoke-CheckedProcess -Times $expectedInstallerCalls -Exactly
+            $expectedEdgeCalls = if ($BlockedComponent -eq 'Edge') { 0 } else { 1 }
+            Should -Invoke Invoke-CheckedProcess -Times $expectedEdgeCalls -Exactly -ParameterFilter {
+                $Activity -eq 'Installing Edge update' -and $Arguments -like '*REBOOT=ReallySuppress MSIRESTARTMANAGERCONTROL=Disable*'
+            }
+            Should -Invoke Stop-Process -Times 0 -Exactly
         }
     }
 

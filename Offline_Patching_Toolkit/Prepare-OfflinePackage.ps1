@@ -78,14 +78,16 @@ try {
             $source = Join-Path $staging "$sourceRoot\$architecture"
             [void](New-Item -ItemType Directory -Path $source -Force)
             $configuration = Join-Path $work "Download-$($release.Year)-$architecture.xml"
-            New-OfficeDownloadConfiguration -Path $configuration -SourcePath $source -Edition $edition -Release $release -Version $officeVersion
+            New-OfficeDownloadConfiguration -Path $configuration -SourcePath $source -Edition $edition -Release $release
             [void](Invoke-CheckedProcess -FilePath $setup -Arguments "/download `"$configuration`"" -WorkingDirectory $work -SuccessCodes @(0) -Activity $activity)
-            if (-not $officeVersion) {
-                $versions = @(Get-ChildItem -LiteralPath (Join-Path $source 'Office\Data') -Directory | Where-Object { $_.Name -match '^16\.0\.\d+\.\d+$' })
-                if ($versions.Count -ne 1) { throw "Could not identify one complete Office LTSC $($release.Year) build from the fresh x86 download." }
-                $officeVersion = $versions[0].Name
+            $versions = @(Get-ChildItem -LiteralPath (Join-Path $source 'Office\Data') -Directory | Where-Object { $_.Name -match '^16\.0\.\d+\.\d+$' })
+            if ($versions.Count -ne 1) { throw "Could not identify one complete Office LTSC $($release.Year) build from the fresh $architecture download." }
+            $downloadedVersion = $versions[0].Name
+            if ($officeVersion -and $downloadedVersion -ne $officeVersion) {
+                throw "Office LTSC $($release.Year) downloads returned different builds (x86: $officeVersion; x64: $downloadedVersion). Run preparation again for a matching pair."
             }
-            Assert-OfficeSource -SourcePath $source -Architecture $architecture -Version $officeVersion
+            $officeVersion = $downloadedVersion
+            Assert-OfficeSource -SourcePath $source -Architecture $architecture -Version $officeVersion -RequireRollingCabinet
         }
         [ordered]@{
             ProductId = $release.ProductId; Channel = $release.Channel; Language = $release.Language; Version = $officeVersion
