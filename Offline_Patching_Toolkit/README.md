@@ -7,10 +7,12 @@ For Windows 11 x64 with Defender, Edge Stable, and Office LTSC Professional Plus
 Open **64-bit Windows PowerShell** in the toolkit folder and run:
 
 ```powershell
-.\Prepare-OfflinePackage.ps1 -OutputDirectory 'C:\OfflineDeployments'
+.\Prepare-OfflinePackage.ps1
 ```
 
-Allow **25 GB free** on the output drive. Downloads include the scan catalog, Defender updates, Edge, and separate 32-bit and 64-bit sources for both Office releases. Office downloads show elapsed time, not a percent complete. Wait for **READY**. Never use a folder ending in `.incomplete`. Prepare a new package to add 2024 support; don't modify an existing ready folder.
+Press **Enter** to save to the default folder (`C:\OfflineDeployments`), or enter a different folder path when prompted. You can also pass `-OutputDirectory 'D:\OfflineDeployments'` to skip the prompt.
+
+Allow **15 GB free** on the output drive. Downloads include the scan catalog, Defender updates, Edge, and separate 32-bit and 64-bit sources for both Office releases. Office downloads show elapsed time, not a percent complete. Wait for **READY**. Never use a folder ending in `.incomplete`. Prepare a new package to add 2024 support; don't modify an existing ready folder.
 
 ## 2. Transfer the folder - standalone PC
 
@@ -24,7 +26,7 @@ Choose **1 - Update and Report**, review the warning, and press **Enter** to pro
 
 The tool updates Defender, Edge, and Office, scans for missing Windows patches, and opens **OfflineUpdateReport.html** with the patch list and software versions. The same package works on both Office releases: it selects the installed edition, update channel, and bitness without migrating Office or changing its licensing.
 
-Open Edge windows and running Office apps block only their own update. Edge background processes without a window do not block the installer, and the toolkit does not terminate them or change Edge settings. If the installer requests a restart, restart manually. Leave the Office Click-to-Run service running.
+Open Edge windows, Edge running in another signed-in user session, and running Office apps block only their own update and are never force-closed. When no Edge window is open in your session, the toolkit closes background Edge processes before updating Edge so the installer can replace `msedge.exe` without changing Edge settings. If the installer still stages an update or requests a restart, restart manually and retry. Leave the Office Click-to-Run service running.
 
 Product installers and version checks show their current activity and elapsed time. Wait for the report before treating an update as complete.
 

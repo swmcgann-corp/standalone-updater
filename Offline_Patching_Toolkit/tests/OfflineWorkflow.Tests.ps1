@@ -311,6 +311,45 @@ Describe 'Package preparation contracts' {
         Test-Path -LiteralPath $destination | Should -BeFalse
     }
 
+    It 'defaults to C:\OfflineDeployments without prompting in WhatIf mode' {
+        Mock Read-Host { throw 'WhatIf preview must not prompt' }
+        $command = Get-Command (Join-Path $script:Toolkit 'Prepare-OfflinePackage.ps1')
+        $command.ScriptBlock.Ast.ParamBlock.Parameters[0].DefaultValue.Value | Should -Be 'C:\OfflineDeployments'
+        & (Join-Path $script:Toolkit 'Prepare-OfflinePackage.ps1') -WhatIf
+        Should -Invoke Read-Host -Times 0 -Exactly
+    }
+
+    It 'resolves default, custom, and quoted preparation output folders' {
+        Resolve-PreparationOutputDirectory -DefaultPath 'C:\OfflineDeployments' -PromptInput '' | Should -Be 'C:\OfflineDeployments'
+        Resolve-PreparationOutputDirectory -DefaultPath 'C:\OfflineDeployments' -PromptInput '   ' | Should -Be 'C:\OfflineDeployments'
+        Resolve-PreparationOutputDirectory -DefaultPath 'C:\OfflineDeployments' -PromptInput '""' | Should -Be 'C:\OfflineDeployments'
+        Resolve-PreparationOutputDirectory -DefaultPath 'C:\OfflineDeployments' -PromptInput 'D:\CustomPackages' | Should -Be 'D:\CustomPackages'
+        Resolve-PreparationOutputDirectory -DefaultPath 'C:\OfflineDeployments' -PromptInput '"D:\My Packages"' | Should -Be 'D:\My Packages'
+        Resolve-PreparationOutputDirectory -DefaultPath 'C:\OfflineDeployments' -PromptInput "'E:\Offline Kit'" | Should -Be 'E:\Offline Kit'
+    }
+
+    It 'prompts for an alternate output folder when OutputDirectory is omitted' {
+        Mock Read-Host { '"\\not-a-drive\packages"' }
+        { & (Join-Path $script:Toolkit 'Prepare-OfflinePackage.ps1') } | Should -Throw '*local or mapped drive path*\\not-a-drive\packages*'
+        Should -Invoke Read-Host -Times 1 -Exactly
+    }
+
+    It 'does not prompt when OutputDirectory is provided explicitly' {
+        Mock Read-Host { throw 'Must not prompt when OutputDirectory is specified' }
+        { & (Join-Path $script:Toolkit 'Prepare-OfflinePackage.ps1') -OutputDirectory '\\not-a-drive\explicit' } | Should -Throw '*local or mapped drive path*\\not-a-drive\explicit*'
+        Should -Invoke Read-Host -Times 0 -Exactly
+    }
+
+    It 'enforces a 15 GB minimum free-space requirement for preparation' {
+        InModuleScope OfflineUpdate.Common {
+            Mock Get-DriveAvailableFreeSpace { 15GB - 1 }
+            { Assert-PreparationFreeSpace -OutputDirectory 'C:\OfflineDeployments' } | Should -Throw '*at least 15 GB free*'
+            Mock Get-DriveAvailableFreeSpace { 15GB }
+            { Assert-PreparationFreeSpace -OutputDirectory 'C:\OfflineDeployments' } | Should -Not -Throw
+            { Assert-PreparationFreeSpace -OutputDirectory '\\server\share\packages' } | Should -Throw '*local or mapped drive path*'
+        }
+    }
+
     It 'selects only the newest Stable Windows x64 MSI' {
         $releases = @(
             [pscustomobject]@{ Platform = 'Windows'; Architecture = 'x64'; ProductVersion = '130.0.1.0'; Artifacts = @([pscustomobject]@{ ArtifactName = 'msi'; Location = 'old'; HashAlgorithm = 'SHA256'; Hash = '1' }) }
@@ -437,7 +476,7 @@ Describe 'Office update configuration safety' {
         $xml.SelectNodes('//Add|//Remove|//RemoveMSI|//Property|//@MigrateArch').Count | Should -Be 0
     }
 
-    It 'applies only the matching Office 2024 <Architecture> source and verifies its build' -TestCases @(
+    It 'applies only the matching Office 2024 <Architecture> source and triggers immediate C2R update' -TestCases @(
         @{ Architecture = 'x86' }, @{ Architecture = 'x64' }
     ) {
         param($Architecture)
@@ -453,11 +492,13 @@ Describe 'Office update configuration safety' {
             Mock Get-RegistryValues { $null }
             Mock Get-ScheduledTask { [pscustomobject]@{ State = 'Ready' } }
             Mock Get-Service { [pscustomobject]@{ Status = 'Running' } }
+            Mock Get-OfficeC2RClientPath { 'C:\Program Files\Common Files\Microsoft Shared\ClickToRun\OfficeC2RClient.exe' }
+            Mock Assert-MicrosoftSignature {}
             Mock Assert-OfficeSource {}
             Mock Save-OfficeUpdateSettings { [pscustomobject]@{ Name = 'UpdateUrl'; Existed = $false } }
             Mock Restore-OfficeUpdateSettings {}
             Mock Invoke-CheckedProcess { 0 }
-            Mock Start-ScheduledTask {}
+            Mock Start-ScheduledTask { throw 'Scheduled task fallback should not run when OfficeC2RClient.exe is available' }
             Mock Get-SystemInventory {
                 $Fixture.Inventory.Office.Version = '16.0.17932.21140'
                 $Fixture.Inventory
@@ -469,12 +510,40 @@ Describe 'Office update configuration safety' {
             $xml.Configuration.Updates.Channel | Should -Be 'PerpetualVL2024'
             $xml.Configuration.ChildNodes.Count | Should -Be 1
             Should -Invoke Assert-OfficeSource -Times 1 -Exactly -ParameterFilter { $RequireRollingCabinet }
+            Should -Invoke Assert-MicrosoftSignature -Times 1 -Exactly -ParameterFilter { $Path -like '*OfficeC2RClient.exe' }
+            Should -Invoke Invoke-CheckedProcess -Times 1 -Exactly -ParameterFilter {
+                $FilePath -like '*OfficeC2RClient.exe' -and
+                $Arguments -eq '/update user updatetoversion=16.0.17932.21140 displaylevel=false forceappshutdown=false updatepromptuser=false'
+            }
+            Should -Invoke Start-ScheduledTask -Times 0 -Exactly
+            Should -Invoke Restore-OfficeUpdateSettings -Times 1 -Exactly
+        }
+    }
+
+    It 'falls back to the Office scheduled task when OfficeC2RClient.exe is unavailable' {
+        $state = New-TestState
+        InModuleScope OfflineUpdate.Common -Parameters @{ Fixture = $state } {
+            param($Fixture)
+            Mock Get-RegistryValues { $null }
+            Mock Get-ScheduledTask { [pscustomobject]@{ State = 'Ready' } }
+            Mock Get-Service { [pscustomobject]@{ Status = 'Running' } }
+            Mock Get-OfficeC2RClientPath { '' }
+            Mock Assert-OfficeSource {}
+            Mock Save-OfficeUpdateSettings { [pscustomobject]@{ Name = 'UpdateUrl'; Existed = $false } }
+            Mock Restore-OfficeUpdateSettings {}
+            Mock Invoke-CheckedProcess { 0 }
+            Mock Start-ScheduledTask {}
+            Mock Get-SystemInventory {
+                $Fixture.Inventory.Office.Version = '16.0.2.0'
+                $Fixture.Inventory
+            }
+            Invoke-OfficeLocalUpdate $TestDrive $TestDrive $Fixture.Package $Fixture.Inventory -TimeoutSeconds 0 | Should -Be 0
             Should -Invoke Start-ScheduledTask -Times 1 -Exactly
             Should -Invoke Restore-OfficeUpdateSettings -Times 1 -Exactly
         }
     }
 
-    It 'reports the observed Office build and task result without treating task completion as success' {
+    It 'reports the observed Office build, ClickToRun state, and task result without treating task completion as success' {
         $state = New-TestState
         $state.Package.Office = New-TestMixedOfficePackage
         $state.Inventory.Office.ProductReleaseIds = 'ProPlus2024Volume'
@@ -483,10 +552,11 @@ Describe 'Office update configuration safety' {
         InModuleScope OfflineUpdate.Common -Parameters @{ Fixture = $state } {
             param($Fixture)
             Mock Get-SystemInventory { $Fixture.Inventory }
+            Mock Get-RegistryValues { [pscustomobject]@{ UpdatesReadyToApply = '1'; BlockedReason = 'AppRunning' } }
             Mock Get-ScheduledTask { [pscustomobject]@{ State = 'Ready' } }
             Mock Get-ScheduledTaskInfo { [pscustomobject]@{ LastRunTime = [datetime]'2026-11-20T14:00:00'; LastTaskResult = 0 } }
             { Wait-ProductTarget Office $Fixture.Package -TimeoutSeconds 0 } |
-                Should -Throw '*Last observed build: 16.0.17932.20670; packaged target: 16.0.17932.21140*state: Ready*Last run: 2026-11-20 14:00:00; task result: 0x00000000*'
+                Should -Throw '*Last observed build: 16.0.17932.20670; packaged target: 16.0.17932.21140*UpdatesReadyToApply=1; BlockedReason=AppRunning*state: Ready*Last run: 2026-11-20 14:00:00; task result: 0x00000000*'
         }
     }
 
@@ -497,6 +567,7 @@ Describe 'Office update configuration safety' {
             Mock Get-RegistryValues { $null }
             Mock Get-ScheduledTask { [pscustomobject]@{ State = 'Ready' } }
             Mock Get-Service { [pscustomobject]@{ Status = 'Running' } }
+            Mock Get-OfficeC2RClientPath { '' }
             Mock Assert-OfficeSource {}
             Mock Save-OfficeUpdateSettings { [pscustomobject]@{ Name = 'UpdateUrl'; Existed = $false } }
             Mock Restore-OfficeUpdateSettings {}
@@ -508,11 +579,17 @@ Describe 'Office update configuration safety' {
         }
     }
 
-    It 'refuses to override an IT update policy' {
+    It 'refuses to override an IT or Cloud Update policy' -TestCases @(
+        @{ PolicyPath = 'SOFTWARE\Policies\Microsoft\Office\16.0\Common\OfficeUpdate' }
+        @{ PolicyPath = 'SOFTWARE\Policies\Microsoft\cloud\office\16.0\Common\officeupdate' }
+    ) {
+        param($PolicyPath)
         $state = New-TestState
-        InModuleScope OfflineUpdate.Common -Parameters @{ Fixture = $state } {
-            param($Fixture)
-            Mock Get-RegistryValues { [pscustomobject]@{ UpdatePath = '\\IT\ManagedOffice' } }
+        InModuleScope OfflineUpdate.Common -Parameters @{ Fixture = $state; PolicyPath = $PolicyPath } {
+            param($Fixture, $PolicyPath)
+            Mock Get-RegistryValues {
+                if ($Path -eq $PolicyPath) { [pscustomobject]@{ UpdatePath = '\\IT\ManagedOffice' } }
+            }
             Mock Save-OfficeUpdateSettings { throw 'Must not change managed Office' }
             Mock Invoke-CheckedProcess { throw 'Must not run setup' }
             { Invoke-OfficeLocalUpdate $TestDrive $TestDrive $Fixture.Package $Fixture.Inventory } | Should -Throw '*managed by IT*'
@@ -589,20 +666,24 @@ Describe 'Installed product selection' {
     }
 
     It 'limits the effect of <Scenario>' -TestCases @(
-        @{ Scenario = 'background Edge'; RunningProcess = 'msedge'; HasWindow = $false; BlockedComponent = '' }
-        @{ Scenario = 'an open Edge window'; RunningProcess = 'msedge'; HasWindow = $true; BlockedComponent = 'Edge' }
-        @{ Scenario = 'running Word'; RunningProcess = 'WINWORD'; HasWindow = $false; BlockedComponent = 'Office' }
-        @{ Scenario = 'the Office Click-to-Run service'; RunningProcess = 'OfficeClickToRun'; HasWindow = $false; BlockedComponent = '' }
+        @{ Scenario = 'background Edge in the current session'; RunningProcess = 'msedge'; HasWindow = $false; SessionId = 1; BlockedComponent = ''; ExpectStop = $true }
+        @{ Scenario = 'an open Edge window'; RunningProcess = 'msedge'; HasWindow = $true; SessionId = 1; BlockedComponent = 'Edge'; ExpectStop = $false }
+        @{ Scenario = 'Edge in another user session'; RunningProcess = 'msedge'; HasWindow = $false; SessionId = 2; BlockedComponent = 'Edge'; ExpectStop = $false }
+        @{ Scenario = 'running Word'; RunningProcess = 'WINWORD'; HasWindow = $false; SessionId = 1; BlockedComponent = 'Office'; ExpectStop = $false }
+        @{ Scenario = 'the Office Click-to-Run service'; RunningProcess = 'OfficeClickToRun'; HasWindow = $false; SessionId = 1; BlockedComponent = ''; ExpectStop = $false }
     ) {
-        param($RunningProcess, $HasWindow, $BlockedComponent)
-        InModuleScope OfflineUpdate.Common -Parameters @{ Fixture = (New-TestState); RunningProcess = $RunningProcess; HasWindow = $HasWindow; BlockedComponent = $BlockedComponent } {
-            param($Fixture, $RunningProcess, $HasWindow, $BlockedComponent)
+        param($RunningProcess, $HasWindow, $SessionId, $BlockedComponent, $ExpectStop)
+        InModuleScope OfflineUpdate.Common -Parameters @{ Fixture = (New-TestState); RunningProcess = $RunningProcess; HasWindow = $HasWindow; SessionId = $SessionId; BlockedComponent = $BlockedComponent; ExpectStop = $ExpectStop } {
+            param($Fixture, $RunningProcess, $HasWindow, $SessionId, $BlockedComponent, $ExpectStop)
+            $script:edgeStopped = $false
+            Mock Get-CurrentSessionId { 1 }
+            Mock Test-EdgeMsiVersionRegistered { $false }
             Mock Get-Process {
-                if ($Name -contains $RunningProcess) {
-                    [pscustomobject]@{ ProcessName = $RunningProcess; MainWindowHandle = [IntPtr]([int]$HasWindow) }
+                if ($Name -contains $RunningProcess -and -not $script:edgeStopped) {
+                    [pscustomobject]@{ Id = 4242; ProcessName = $RunningProcess; MainWindowHandle = [IntPtr]([int]$HasWindow); SessionId = $SessionId }
                 }
             }
-            Mock Stop-Process { throw 'No product process should be force-closed' }
+            Mock Stop-Process { $script:edgeStopped = $true }
             Mock Invoke-CheckedProcess { 0 }
             Mock Invoke-OfficeLocalUpdate { 0 }
             Mock Wait-ProductTarget { $Fixture.Inventory }
@@ -621,9 +702,68 @@ Describe 'Installed product selection' {
             Should -Invoke Invoke-CheckedProcess -Times $expectedInstallerCalls -Exactly
             $expectedEdgeCalls = if ($BlockedComponent -eq 'Edge') { 0 } else { 1 }
             Should -Invoke Invoke-CheckedProcess -Times $expectedEdgeCalls -Exactly -ParameterFilter {
-                $Activity -eq 'Installing Edge update' -and $Arguments -like '*REBOOT=ReallySuppress MSIRESTARTMANAGERCONTROL=Disable*'
+                $Activity -eq 'Installing Edge update' -and $Arguments -like '*REBOOT=ReallySuppress MSIRESTARTMANAGERCONTROL=Disable*' -and $Arguments -notlike '*REINSTALL=ALL*'
             }
+            $expectedStopCalls = if ($ExpectStop) { 1 } else { 0 }
+            Should -Invoke Stop-Process -Times $expectedStopCalls -Exactly
+        }
+    }
+
+    It 'never stops background Edge child processes when any Edge window is open' {
+        InModuleScope OfflineUpdate.Common {
+            Mock Get-CurrentSessionId { 1 }
+            Mock Get-Process {
+                @(
+                    [pscustomobject]@{ Id = 1001; ProcessName = 'msedge'; MainWindowHandle = [IntPtr]68622; SessionId = 1 }
+                    [pscustomobject]@{ Id = 1002; ProcessName = 'msedge'; MainWindowHandle = [IntPtr]::Zero; SessionId = 1 }
+                )
+            }
+            Mock Stop-Process { throw 'Must not stop any Edge process while a window is open' }
+            $ready = Stop-EdgeBackgroundProcesses -TimeoutSeconds 0
+            $ready.Ready | Should -BeFalse
+            $ready.Message | Should -Match 'Nothing was force-closed'
             Should -Invoke Stop-Process -Times 0 -Exactly
+        }
+    }
+
+    It 'passes REINSTALL flags only when the exact Edge MSI version is already registered' {
+        $state = New-TestState
+        $state.Package.Edge.Version = '158.0.4370.33'
+        InModuleScope OfflineUpdate.Common -Parameters @{ Fixture = $state } {
+            param($Fixture)
+            Mock Get-RegistryValues {
+                if ($View -eq 'Registry32') { [pscustomobject]@{ EnterpriseProductA8C19508 = '158.0.4370.33' } }
+            }
+            Mock Invoke-CheckedProcess { 0 }
+            Invoke-EdgeLocalUpdate $TestDrive $TestDrive $Fixture.Package | Should -Be 0
+            Should -Invoke Invoke-CheckedProcess -Times 1 -Exactly -ParameterFilter {
+                $Activity -eq 'Installing Edge update' -and $Arguments -like '*REINSTALL=ALL REINSTALLMODE=vomus*'
+            }
+        }
+    }
+
+    It 'reports RebootRequired instead of a timeout when Edge stages new_msedge.exe while msedge.exe stays old' {
+        $state = New-TestState
+        $state.Package.Edge.Version = '158.0.4370.33'
+        $state.Inventory.Edge.Version = '157.0.4341.60'
+        $state.Inventory.Edge | Add-Member -NotePropertyName 'ExecutablePath' -NotePropertyValue 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe' -Force
+        $state.Inventory.Defender.SignatureVersion = '1.2.0.0'
+        InModuleScope OfflineUpdate.Common -Parameters @{ Fixture = $state } {
+            param($Fixture)
+            Mock Get-Process { @() }
+            Mock Test-EdgeMsiVersionRegistered { $false }
+            Mock Invoke-CheckedProcess { 0 }
+            Mock Invoke-OfficeLocalUpdate { throw 'Must not run Office when Edge requires restart' }
+            Mock Get-SystemInventory { $Fixture.Inventory }
+            Mock Get-EdgeStagedVersion { '158.0.4370.33' }
+            Mock Wait-UpdatePoll { throw 'Wait-UpdatePoll should not be called with zero timeout' }
+            $staged = Wait-ProductTarget -Component Edge -Package $Fixture.Package -TimeoutSeconds 0
+            $staged.Edge.StagedVersion | Should -Be '158.0.4370.33'
+            Mock Wait-ProductTarget { $staged }
+            $results = @(Invoke-LocalProductUpdates $TestDrive $TestDrive $Fixture.Package $Fixture.Inventory)
+            ($results | Where-Object Component -EQ Edge).Status | Should -Be 'RebootRequired'
+            ($results | Where-Object Component -EQ Edge).Message | Should -Match 'new_msedge\.exe'
+            ($results | Where-Object Component -EQ Office).Status | Should -Be 'NotRun'
         }
     }
 
@@ -663,6 +803,7 @@ Describe 'Installed product selection' {
         InModuleScope OfflineUpdate.Common -Parameters @{ Fixture = $state } {
             param($Fixture)
             Mock Get-SystemInventory { $Fixture.Inventory }
+            Mock Get-EdgeStagedVersion { '' }
             Mock Wait-UpdatePoll { throw 'A zero-timeout test must not sleep' }
             Mock Write-Progress {}
             { Wait-ProductTarget -Component Edge -Package $Fixture.Package -TimeoutSeconds 0 } | Should -Throw '*NOT assumed*'

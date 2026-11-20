@@ -1,7 +1,7 @@
 #requires -version 5.1
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-    [string]$OutputDirectory = (Join-Path $PSScriptRoot 'Deployments'),
+    [string]$OutputDirectory = 'C:\OfflineDeployments',
     [uri]$Proxy,
     [switch]$ProxyUseDefaultCredentials
 )
@@ -9,12 +9,19 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot '00-Control\OfflineUpdate.Common.psm1') -Force -DisableNameChecking
+if (-not $PSBoundParameters.ContainsKey('OutputDirectory') -and -not $WhatIfPreference) {
+    Write-Host "Default output folder: $OutputDirectory"
+    $customOutput = Read-Host 'Press Enter to use the default, or enter a different folder path'
+    $OutputDirectory = Resolve-PreparationOutputDirectory -DefaultPath $OutputDirectory -PromptInput $customOutput
+}
+else {
+    $OutputDirectory = Resolve-PreparationOutputDirectory -DefaultPath $OutputDirectory
+}
 if (-not $PSCmdlet.ShouldProcess($OutputDirectory, 'Download Microsoft payloads and create a dated deployment folder (several GB)')) { return }
 if ($env:OS -ne 'Windows_NT' -or -not [Environment]::Is64BitProcess) { throw 'Run preparation in 64-bit Windows PowerShell on the connected Windows PC.' }
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-$OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
-$drive = New-Object IO.DriveInfo ([IO.Path]::GetPathRoot($OutputDirectory))
-if ($drive.AvailableFreeSpace -lt 25GB) { throw 'Preparation requires at least 25 GB free on the output drive.' }
+Assert-PreparationFreeSpace -OutputDirectory $OutputDirectory -MinimumBytes 15GB
+Write-Host "Output folder: $OutputDirectory"
 [void](New-Item -ItemType Directory -Path $OutputDirectory -Force)
 $name = 'Deploy_{0}_{1}' -f (Get-Date -Format 'yyyy-MM-dd_HHmmss'), [guid]::NewGuid().ToString('N').Substring(0, 6)
 $staging = Join-Path $OutputDirectory ($name + '.incomplete')

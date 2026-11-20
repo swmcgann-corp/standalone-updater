@@ -391,6 +391,45 @@ function Resolve-PackagePath {
     return $fullPath
 }
 
+function Resolve-PreparationOutputDirectory {
+    param([string]$DefaultPath = 'C:\OfflineDeployments', [string]$PromptInput = '')
+    $selected = $DefaultPath
+    if (-not [string]::IsNullOrWhiteSpace($PromptInput)) {
+        $trimmed = $PromptInput.Trim()
+        if ($trimmed.Length -ge 2 -and (
+            ($trimmed.StartsWith('"') -and $trimmed.EndsWith('"')) -or
+            ($trimmed.StartsWith("'") -and $trimmed.EndsWith("'"))
+        )) {
+            $trimmed = $trimmed.Substring(1, $trimmed.Length - 2).Trim()
+        }
+        if (-not [string]::IsNullOrWhiteSpace($trimmed)) { $selected = $trimmed }
+    }
+    if ([string]::IsNullOrWhiteSpace($selected)) { throw 'Output folder path cannot be empty.' }
+    if ($selected -match '^[A-Za-z]:[\\/]' -or $selected.StartsWith('\\')) {
+        return [IO.Path]::GetFullPath($selected)
+    }
+    return [IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($selected))
+}
+
+function Get-DriveAvailableFreeSpace {
+    param([string]$Root)
+    $drive = New-Object IO.DriveInfo $Root
+    if (-not $drive.IsReady) { throw "Output drive '$Root' is not ready or does not exist." }
+    return [int64]$drive.AvailableFreeSpace
+}
+
+function Assert-PreparationFreeSpace {
+    param([string]$OutputDirectory, [int64]$MinimumBytes = 15GB)
+    $root = [IO.Path]::GetPathRoot($OutputDirectory)
+    if (-not $root -or $root -notmatch '^[A-Za-z]:\\$') {
+        throw "Preparation requires a local or mapped drive path (for example, C:\OfflineDeployments): '$OutputDirectory'."
+    }
+    if ((Get-DriveAvailableFreeSpace -Root $root) -lt $MinimumBytes) {
+        $minimumGb = [math]::Round($MinimumBytes / 1GB, 0)
+        throw "Preparation requires at least $minimumGb GB free on the output drive."
+    }
+}
+
 function Assert-MicrosoftSignature {
     param([string]$Path)
     $signature = Get-AuthenticodeSignature -LiteralPath $Path
@@ -707,6 +746,101 @@ function Restore-OfficeUpdateSettings {
 
 function Wait-UpdatePoll { Start-Sleep -Seconds 2 }
 
+function Get-CurrentSessionId {
+    return (Get-Process -Id $PID -ErrorAction Stop).SessionId
+}
+
+function Get-EdgeStagedVersion {
+    param([string]$ExecutablePath)
+    if (-not $ExecutablePath) { return '' }
+    $staged = Join-Path (Split-Path $ExecutablePath -Parent) 'new_msedge.exe'
+    if (Test-Path -LiteralPath $staged -PathType Leaf) {
+        return [string](Get-Item -LiteralPath $staged).VersionInfo.FileVersion
+    }
+    return ''
+}
+
+function Test-EdgeMsiVersionRegistered {
+    param([string]$TargetVersion)
+    if (-not $TargetVersion) { return $false }
+    foreach ($view in @('Registry32', 'Registry64')) {
+        $state = Get-RegistryValues 'SOFTWARE\Microsoft\EdgeUpdate\ClientState\{56EB18F8-B008-4CBD-B6D2-8C97FE7E9062}' $view
+        if ($null -eq $state) { continue }
+        foreach ($property in $state.PSObject.Properties) {
+            if ($property.Name -like 'EnterpriseProduct*' -and [string]$property.Value -eq $TargetVersion) {
+                return $true
+            }
+        }
+    }
+    return $false
+}
+
+function Stop-EdgeBackgroundProcesses {
+    param([int]$TimeoutSeconds = 15)
+    $processes = @(Get-Process -Name 'msedge' -ErrorAction SilentlyContinue)
+    if ($processes.Count -eq 0) { return [pscustomobject]@{ Ready = $true; Message = '' } }
+    if (@($processes | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero }).Count -gt 0) {
+        return [pscustomobject]@{
+            Ready = $false
+            Message = 'Close the listed Edge processes (msedge), then run Update and Report again. Nothing was force-closed.'
+        }
+    }
+    $currentSession = Get-CurrentSessionId
+    if (@($processes | Where-Object { (Get-OptionalProperty $_ 'SessionId' $currentSession) -ne $currentSession }).Count -gt 0) {
+        return [pscustomobject]@{
+            Ready = $false
+            Message = 'Edge is running in another user session (msedge). Close Edge in all signed-in sessions, then run Update and Report again. Nothing was force-closed.'
+        }
+    }
+    Write-Host "Closing $($processes.Count) background Edge process(es) with no open windows..."
+    foreach ($process in $processes) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        $remaining = @(Get-Process -Name 'msedge' -ErrorAction SilentlyContinue)
+        if ($remaining.Count -eq 0) { return [pscustomobject]@{ Ready = $true; Message = '' } }
+        if (@($remaining | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero }).Count -gt 0) {
+            return [pscustomobject]@{
+                Ready = $false
+                Message = 'Close the listed Edge processes (msedge), then run Update and Report again. Nothing was force-closed.'
+            }
+        }
+        if (@($remaining | Where-Object { (Get-OptionalProperty $_ 'SessionId' $currentSession) -ne $currentSession }).Count -gt 0) {
+            return [pscustomobject]@{
+                Ready = $false
+                Message = 'Edge is running in another user session (msedge). Close Edge in all signed-in sessions, then run Update and Report again. Nothing was force-closed.'
+            }
+        }
+        if ($timer.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+            return [pscustomobject]@{
+                Ready = $false
+                Message = 'Background Edge processes (msedge) did not exit. Close Edge or restart, then run Update and Report again.'
+            }
+        }
+        Wait-UpdatePoll
+        foreach ($process in $remaining) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Invoke-EdgeLocalUpdate {
+    param([string]$Root, [string]$Directory, $Package)
+    $installer = Resolve-PackagePath $Root $Package.Edge.Path
+    $log = Join-Path $Directory 'EdgeInstaller.log'
+    $arguments = "/i `"$installer`" /qn /norestart REBOOT=ReallySuppress MSIRESTARTMANAGERCONTROL=Disable /L*v `"$log`""
+    if (Test-EdgeMsiVersionRegistered $Package.Edge.Version) {
+        $arguments = "/i `"$installer`" REINSTALL=ALL REINSTALLMODE=vomus /qn /norestart REBOOT=ReallySuppress MSIRESTARTMANAGERCONTROL=Disable /L*v `"$log`""
+    }
+    Invoke-CheckedProcess "$env:SystemRoot\System32\msiexec.exe" $arguments $Directory -Activity 'Installing Edge update'
+}
+
+function Get-OfficeC2RClientPath {
+    param($ConfigurationValues)
+    $clientFolder = Get-OptionalProperty $ConfigurationValues 'ClientFolder' ''
+    if (-not $clientFolder) { $clientFolder = Join-Path $env:CommonProgramFiles 'Microsoft Shared\ClickToRun' }
+    $clientPath = Join-Path $clientFolder 'OfficeC2RClient.exe'
+    if (Test-Path -LiteralPath $clientPath -PathType Leaf) { return $clientPath }
+    return ''
+}
+
 function Wait-ProductTarget {
     param([string]$Component, $Package, [int]$TimeoutSeconds = 120)
     $timer = [Diagnostics.Stopwatch]::StartNew()
@@ -718,13 +852,34 @@ function Wait-ProductTarget {
             $plan = @(Get-ProductUpdatePlan $inventory $Package | Where-Object { $_.Component -eq $Component })[0]
             $finished = ($plan.Status -eq 'Current')
             if ($finished -and $Component -eq 'Office') {
-                $finished = ((Get-ScheduledTask -TaskPath '\Microsoft\Office\' -TaskName 'Office Automatic Updates 2.0' -ErrorAction Stop).State -ne 'Running')
+                $task = Get-ScheduledTask -TaskPath '\Microsoft\Office\' -TaskName 'Office Automatic Updates 2.0' -ErrorAction SilentlyContinue
+                $finished = ($null -eq $task -or $task.State -ne 'Running')
             }
             if ($finished) { return $inventory }
+            if ($Component -eq 'Edge') {
+                $stagedVersion = Get-EdgeStagedVersion (Get-OptionalProperty $inventory.Edge 'ExecutablePath' '')
+                if ($stagedVersion) {
+                    $stagedCurrent = $false
+                    try { $stagedCurrent = Test-VersionAtLeast $stagedVersion $Package.Edge.Version } catch {}
+                    if ($stagedCurrent -and $timer.Elapsed.TotalSeconds -ge [math]::Min(10, $TimeoutSeconds)) {
+                        $inventory.Edge | Add-Member -NotePropertyName 'StagedVersion' -NotePropertyValue $stagedVersion -Force
+                        return $inventory
+                    }
+                }
+            }
             if ($timer.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
                 $message = "$Component did not reach the packaged target version within $TimeoutSeconds seconds. Verification is required; success was NOT assumed."
                 if ($Component -eq 'Office') {
                     $message = "Office update could not be verified within $TimeoutSeconds seconds. Last observed build: $($plan.Before); packaged target: $($plan.Target)."
+                    try {
+                        $updatesState = Get-RegistryValues 'SOFTWARE\Microsoft\Office\ClickToRun\Updates'
+                        if ($null -ne $updatesState) {
+                            $ready = Get-OptionalProperty $updatesState 'UpdatesReadyToApply' ''
+                            $blocked = Get-OptionalProperty $updatesState 'BlockedReason' ''
+                            if ($ready -ne '' -or $blocked) { $message += " ClickToRun state: UpdatesReadyToApply=$ready; BlockedReason=$blocked." }
+                        }
+                    }
+                    catch {}
                     try {
                         $task = Get-ScheduledTask -TaskPath '\Microsoft\Office\' -TaskName 'Office Automatic Updates 2.0' -ErrorAction Stop
                         $message += " Office Automatic Updates 2.0 state: $($task.State)."
@@ -745,14 +900,19 @@ function Invoke-OfficeLocalUpdate {
     param([string]$Root, [string]$Directory, $Package, $Inventory, [int]$TimeoutSeconds = 1800)
     $release = Get-OfficePackageRelease $Package.Office $Inventory.Office
     if ($null -eq $release) { throw 'No prepared Office source matches the installed release.' }
-    foreach ($view in @('Registry64', 'Registry32')) {
-        $policy = Get-RegistryValues 'SOFTWARE\Policies\Microsoft\Office\16.0\Common\OfficeUpdate' $view
-        if ($null -ne $policy -and @($policy.PSObject.Properties).Count -gt 0) { throw 'Office update policy is managed by IT. No policy was overridden; arrange the local update with IT.' }
+    foreach ($policyPath in @('SOFTWARE\Policies\Microsoft\Office\16.0\Common\OfficeUpdate', 'SOFTWARE\Policies\Microsoft\cloud\office\16.0\Common\officeupdate')) {
+        foreach ($view in @('Registry64', 'Registry32')) {
+            $policy = Get-RegistryValues $policyPath $view
+            if ($null -ne $policy -and @($policy.PSObject.Properties).Count -gt 0) { throw 'Office update policy is managed by IT. No policy was overridden; arrange the local update with IT.' }
+        }
     }
-    $configurationValues = Get-RegistryValues 'SOFTWARE\Microsoft\Office\ClickToRun\Configuration'
+    $configurationValues = Get-RegistryValues 'SOFTWARE\Microsoft\Office\ClickToRun\Configuration' 'Registry64'
+    if ($null -eq $configurationValues) { $configurationValues = Get-RegistryValues 'SOFTWARE\Microsoft\Office\ClickToRun\Configuration' 'Registry32' }
     if ((Get-OptionalProperty $configurationValues 'OfficeMgmtCOM' 'False') -match '^(True|1)$') { throw 'Office updates are managed by Configuration Manager; no management settings were changed.' }
-    $task = Get-ScheduledTask -TaskPath '\Microsoft\Office\' -TaskName 'Office Automatic Updates 2.0' -ErrorAction Stop
-    if ($task.State -in @('Disabled', 'Running')) { throw 'The Office update task is disabled or already running. Resolve this and retry.' }
+    $task = Get-ScheduledTask -TaskPath '\Microsoft\Office\' -TaskName 'Office Automatic Updates 2.0' -ErrorAction SilentlyContinue
+    if ($null -ne $task -and $task.State -eq 'Running') { throw 'The Office update task is already running. Wait for it to finish and retry.' }
+    $c2rClient = Get-OfficeC2RClientPath $configurationValues
+    if (-not $c2rClient -and ($null -eq $task -or $task.State -eq 'Disabled')) { throw 'The Office update task is disabled or unavailable. Resolve this and retry.' }
     if ((Get-Service -Name ClickToRunSvc -ErrorAction Stop).Status -ne 'Running') { throw 'Office Click-to-Run service is not running. Ask IT to restore normal Office servicing, then retry.' }
     $relative = if ($Inventory.Office.Platform -eq 'x86') { $release.X86Path } else { $release.X64Path }
     $source = Resolve-PackagePath $Root $relative
@@ -763,7 +923,13 @@ function Invoke-OfficeLocalUpdate {
     $settings | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $Directory 'OfficeSettingsBefore.json') -Encoding UTF8
     try {
         [void](Invoke-CheckedProcess (Resolve-PackagePath $Root $Package.Office.SetupPath) "/configure `"$configuration`"" $Directory @(0) -Activity 'Configuring Office offline update')
-        Start-ScheduledTask -TaskPath '\Microsoft\Office\' -TaskName 'Office Automatic Updates 2.0' -ErrorAction Stop
+        if ($c2rClient) {
+            Assert-MicrosoftSignature -Path $c2rClient
+            [void](Invoke-CheckedProcess $c2rClient "/update user updatetoversion=$($release.Version) displaylevel=false forceappshutdown=false updatepromptuser=false" $Directory @(0) -Activity 'Updating Office from local source')
+        }
+        else {
+            Start-ScheduledTask -TaskPath '\Microsoft\Office\' -TaskName 'Office Automatic Updates 2.0' -ErrorAction Stop
+        }
         [void](Wait-ProductTarget -Component Office -Package $Package -TimeoutSeconds $TimeoutSeconds)
     }
     finally { Restore-OfficeUpdateSettings -Settings $settings }
@@ -779,15 +945,17 @@ function Invoke-LocalProductUpdates {
         if ($result.Status -eq 'Blocked') { $stop = $true; continue }
         if ($result.Status -ne 'Required') { continue }
         try {
-            $processNames = switch ($result.Component) {
-                'Edge' { 'msedge' }
-                'Office' { 'WINWORD', 'EXCEL', 'OUTLOOK', 'POWERPNT', 'MSACCESS', 'MSPUB', 'ONENOTE', 'VISIO', 'WINPROJ' }
-            }
-            if ($processNames) {
-                $applications = @(Get-Process -Name $processNames -ErrorAction SilentlyContinue)
-                if ($result.Component -eq 'Edge') {
-                    $applications = @($applications | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero })
+            if ($result.Component -eq 'Edge') {
+                $edgeReady = Stop-EdgeBackgroundProcesses
+                if (-not $edgeReady.Ready) {
+                    $result.Status = 'Blocked'
+                    $result.Message = $edgeReady.Message
+                    Write-Warning "$($result.Component): $($result.Message)"
+                    continue
                 }
+            }
+            elseif ($result.Component -eq 'Office') {
+                $applications = @(Get-Process -Name 'WINWORD', 'EXCEL', 'OUTLOOK', 'POWERPNT', 'MSACCESS', 'MSPUB', 'ONENOTE', 'VISIO', 'WINPROJ' -ErrorAction SilentlyContinue)
                 if ($applications.Count -gt 0) {
                     $names = ($applications.ProcessName | Sort-Object -Unique) -join ', '
                     $result.Status = 'Blocked'
@@ -799,11 +967,7 @@ function Invoke-LocalProductUpdates {
             Write-Host "Updating $($result.Component)..."
             $exitCode = switch ($result.Component) {
                 'Defender' { Invoke-CheckedProcess (Resolve-PackagePath $Root $Package.Defender.Path) '/q' $Directory -Activity 'Installing Defender update' }
-                'Edge' {
-                    $installer = Resolve-PackagePath $Root $Package.Edge.Path
-                    $log = Join-Path $Directory 'EdgeInstaller.log'
-                    Invoke-CheckedProcess "$env:SystemRoot\System32\msiexec.exe" "/i `"$installer`" /qn /norestart REBOOT=ReallySuppress MSIRESTARTMANAGERCONTROL=Disable /L*v `"$log`"" $Directory -Activity 'Installing Edge update'
-                }
+                'Edge' { Invoke-EdgeLocalUpdate $Root $Directory $Package }
                 'Office' { Invoke-OfficeLocalUpdate $Root $Directory $Package $Inventory }
             }
             if ($exitCode -in @(3010, 1641)) {
@@ -814,9 +978,17 @@ function Invoke-LocalProductUpdates {
             else {
                 $after = Wait-ProductTarget -Component $result.Component -Package $Package
                 $result.After = if ($result.Component -eq 'Defender') { $after.Defender.SignatureVersion } else { $after.($result.Component).Version }
-                $result.Status = 'Updated'
-                $result.Message = 'Observed installed version meets or exceeds the packaged target.'
-                if ($after.PendingReboot.Any) { $result.Status = 'RebootRequired'; $result.Message += ' Restart manually before continuing.'; $stop = $true }
+                $stagedVersion = if ($result.Component -eq 'Edge') { Get-OptionalProperty $after.Edge 'StagedVersion' '' } else { '' }
+                if ($result.Component -eq 'Edge' -and $stagedVersion -and -not (Test-VersionAtLeast $after.Edge.Version $Package.Edge.Version)) {
+                    $result.Status = 'RebootRequired'
+                    $result.Message = "Edge staged $stagedVersion in new_msedge.exe, but msedge.exe is still $($after.Edge.Version) because files were in use. Restart manually, then run Update and Report again."
+                    $stop = $true
+                }
+                else {
+                    $result.Status = 'Updated'
+                    $result.Message = 'Observed installed version meets or exceeds the packaged target.'
+                    if ($after.PendingReboot.Any) { $result.Status = 'RebootRequired'; $result.Message += ' Restart manually before continuing.'; $stop = $true }
+                }
             }
         }
         catch { $result.Status = 'Failed'; $result.Message = $_.Exception.Message; $stop = $true }
